@@ -1,8 +1,8 @@
 CC = gcc
 CFLAGS = -Wall `pkg-config fuse --cflags --libs` 
 LDFLAGS = 
-OBJFILES = wormholefs.o uidmap.o
-TARGET = ../install/wormholefs
+OBJFILES = obuilderfs.o uidmap.o
+TARGET = ../install/obuilderfs
 
 all: $(TARGET)
 

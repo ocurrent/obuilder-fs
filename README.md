@@ -16,3 +16,5 @@ by a symbolic link inside another folder (e.g. `/data/scoreboard/`) using the `U
 
 (5) obuilder-fs list the directories inside /Volumes/tank/result/abcde12345
 ```
+
+The CLI tool is very simple as expects `<scoreboard-path> <mount-point> <fuse-args-like-allow-other>...`. 

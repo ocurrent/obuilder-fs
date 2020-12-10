@@ -5,8 +5,6 @@
 
   This program can be distributed under the terms of the GNU GPL.
   See the file COPYING.
-
-  gcc -Wall fusexmp_fh.c `pkg-config fuse --cflags --libs` -lulockmgr -o fusexmp_fh
 */
 
 /*
@@ -15,6 +13,15 @@
 
 #define FUSE_USE_VERSION 26
 #define HAVE_SETXATTR 1
+
+#define DEBUG
+
+// Enable this along with the -d option to get more path-related printing
+#ifdef DEBUG
+#define DEBUG_PRINT(x) printf x
+#else
+#define DEBUG_PRINT(x) do { } while (0)
+#endif
 
 #include "uidmap.h"
 #include <sys/syslimits.h>
@@ -57,6 +64,7 @@ typedef unsigned char u_char;
 typedef unsigned short u_short;
 typedef unsigned int u_int;
 typedef unsigned long u_long;
+and
 #endif
 
 #include <sys/attr.h>
@@ -69,16 +77,20 @@ typedef unsigned long u_long;
 
 #endif /* __APPLE__ */
 
-static char root_dest[1024];
+		static char root_dest[1024];
 
-/* The magic: mapping <mount-point> to /Users/$USER/<whatever> */
-char *process_path(const char *path)
+static struct Conf
+{
+	char *scoreboard; // The path to the readlink scoreboard
+} conf;
+
+char *
+process_path(const char *path)
 {
 	char result[256];
 	struct fuse_context *fc = fuse_get_context();
-
-	int status = get_user(fc->uid, result);
-	printf("RESULT %s for UID %i\n", result, fc->uid);
+	int status = get_user(fc->uid, conf.scoreboard, result);
+	DEBUG_PRINT(("RESULT %s for UID %i\n", result, fc->uid));
 
 	if (status == uid_error || status == uid_not_found)
 	{
@@ -88,19 +100,19 @@ char *process_path(const char *path)
 	if (status == uid_ok)
 	{
 		char userpath[2048];
-		fprintf(stdout, "Initial path is: %s\n", userpath);
+		DEBUG_PRINT(("Initial path is: %s\n", userpath));
 		strcpy(userpath, result);
-		fprintf(stdout, "Userpath is: %s\n", userpath);
+		DEBUG_PRINT(("Userpath is: %s\n", userpath));
 		strcat(userpath, "/local");
 
 		// Record this in the settings
 		strcpy(root_dest, userpath);
 
 		// Add the rest of the path
-		printf("PATH IS %s\n", path);
+		DEBUG_PRINT(("PATH IS %s\n", path));
 
 		strcat(userpath, path);
-		fprintf(stdout, "Processed path is: %s\n", userpath);
+		DEBUG_PRINT(("Processed path is: %s\n", userpath));
 		return strdup(userpath);
 	}
 	else
@@ -110,10 +122,10 @@ char *process_path(const char *path)
 		// can mix normal and sudo calls.
 		// get_pid_info(fc->pid); // Prints useful info, TODO: remove
 		char userpath[2048];
-		fprintf(stdout, "Root destination path is: %s\n", root_dest);
+		DEBUG_PRINT(("Root destination path is: %s\n", root_dest));
 		strcpy(userpath, root_dest);
 		strcat(userpath, path);
-		fprintf(stdout, "Together destination path is: %s\n", userpath);
+		DEBUG_PRINT(("Together destination path is: %s\n", userpath));
 		return strdup(userpath);
 	}
 }
@@ -124,7 +136,7 @@ static int xmp_getattr(const char *path, struct stat *stbuf)
 
 	char *new_path = process_path(path);
 
-	printf("Getting attributes for %s but really %s\n", path, new_path);
+	DEBUG_PRINT(("Getting attributes for %s but really %s\n", path, new_path));
 
 	res = lstat(new_path, stbuf);
 	if (res == -1)
@@ -147,7 +159,7 @@ static int xmp_fgetattr(const char *path, struct stat *stbuf,
 	char filePath[PATH_MAX];
 	if (fcntl(fi->fh, F_GETPATH, filePath) != -1)
 	{
-		printf("PATH: %s\n", filePath);
+		DEBUG_PRINT(("PATH: %s\n", filePath));
 	}
 	// Do we need to use path or file handle?
 	res = fstat(fi->fh, stbuf);
@@ -474,7 +486,6 @@ static int xmp_fsetattr_x(const char *path, struct setattr_x *attr,
 	if (SETATTR_WANTS_MODTIME(attr))
 	{
 		struct timeval tv[2];
-		printf("DOING THIS THING MAYBE DO SOMETHING ELSE!\n");
 		if (!SETATTR_WANTS_ACCTIME(attr))
 			gettimeofday(&tv[0], NULL);
 		else
@@ -787,7 +798,6 @@ static int xmp_ftruncate(const char *path, off_t size,
 static int xmp_utimens(const char *path, const struct timespec ts[2])
 {
 	int res;
-	printf("CALLING UTIMENS\n");
 	return 0;
 
 	char *new_path = process_path(path);
@@ -1278,5 +1288,11 @@ static struct fuse_operations xmp_oper = {
 int main(int argc, char *argv[])
 {
 	umask(0);
-	return fuse_main(argc, argv, &xmp_oper, NULL);
+
+	// This is dodgy probably... I'm no C programmer
+	conf.scoreboard = strdup(argv[1]);
+	printf("%s\n", conf.scoreboard);
+	// Replace scoreboard param with program name and pass this to fuse
+	*argv[1] = *argv[0];
+	return fuse_main(argc - 1, argv + 1, &xmp_oper, NULL);
 }

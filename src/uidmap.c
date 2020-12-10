@@ -20,9 +20,15 @@
      2. Redirect to "/Volumes/tank.../foo"
 */
 
-int get_user(uid_t uid, char *result)
+int get_user(uid_t uid, char *sb_path, char *result)
 {
-    // Handle root and default user
+    /* AFAICT the handling of root and the default user is subtle. 
+     * The problem is that if the FUSE filesystem internally tries to access 
+     * either it's own mount point OR a file that doesn't exist and it fails 
+     * then everything hangs, so instead we keep track of the last place to 
+     * be successfully read and redirect these users there where they may 
+     * not find what they are looking for but it doesn't break FUSE. 
+     */
     if (uid == 0)
     {
         // For root
@@ -39,23 +45,22 @@ int get_user(uid_t uid, char *result)
     // Uid to string
     char uid_num[10];
     snprintf(uid_num, 10, "%d", uid);
-
+    printf("SB PATHS! %s\n", sb_path);
     // Create scoreboard symbolic link location
-    strcpy(scoreboard, "/Users/patrickferris/scoreboard/");
+    strcpy(scoreboard, sb_path);
+    strcat(scoreboard, "/");
     strcat(scoreboard, uid_num);
-
-    printf("READING LINK %s", scoreboard);
-
+    printf("READING LINK! %s\n", scoreboard);
     // Read the link
     ssize_t len = readlink(scoreboard, buff, sizeof(buff) - 1);
     if (len != -1)
     {
         buff[len] = '\0';
-        printf("RETURNING %s\n", buff);
+        printf("RESULT: %s", buff);
         strcpy(result, buff);
         return uid_ok;
     }
 
-    printf("STRING TOO LONG!\n");
+    // printf("STRING TOO LONG!\n");
     return -errno;
 }

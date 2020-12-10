@@ -16,6 +16,6 @@ typedef enum UidStatus
   uid_other = 4
 } UidStatus;
 
-int get_user(uid_t uid, char *result);
+int get_user(uid_t uid, char *sb_path, char *result);
 
 #endif
