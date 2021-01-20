@@ -1,0 +1,16 @@
+name: Tests for ppx_deriving_yaml
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        operating-system: [macos-latest]
+    runs-on: ${{ matrix.operating-system }}
+    steps: 
+    - uses: actions/checkout@v2
+    - name: Get FUSE for OSX
+      run: brew install --cask osxfuse
+    - name: Builds
+      run: make 
+    - name: Info
+      run: ./install/obuilderfs --help
