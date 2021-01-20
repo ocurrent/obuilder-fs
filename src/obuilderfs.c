@@ -20,7 +20,10 @@
 #ifdef DEBUG
 #define DEBUG_PRINT(x) printf x
 #else
-#define DEBUG_PRINT(x) do { } while (0)
+#define DEBUG_PRINT(x) \
+	do                   \
+	{                    \
+	} while (0)
 #endif
 
 #include "uidmap.h"
@@ -1288,6 +1291,12 @@ static struct fuse_operations xmp_oper = {
 int main(int argc, char *argv[])
 {
 	umask(0);
+
+	if (!strcmp(argv[1], "--help"))
+	{
+		printf("~~~ obuilder-fs version: 0.0.1 ~~~\n Usage:\n obuilderfs <scoreboard-path> <mount-point> <fuse-args-like-allow-other>\n");
+		return 0;
+	}
 
 	// This is dodgy probably... I'm no C programmer
 	conf.scoreboard = strdup(argv[1]);
