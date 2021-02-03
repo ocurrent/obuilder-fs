@@ -853,17 +853,11 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
 										struct fuse_file_info *fi)
 {
 	int res;
-
-	char *new_path = process_path(path);
-	int fd = open(new_path, fi->flags);
-	// File handle okay?
-	res = pread(fd, buf, size, offset);
+	res = pread(fi->fh, buf, size, offset);
 	if (res == -1)
+	{
 		res = -errno;
-
-	close(fd);
-	free(new_path);
-
+	}
 	return res;
 }
 
@@ -893,19 +887,11 @@ static int xmp_write(const char *path, const char *buf, size_t size,
 										 off_t offset, struct fuse_file_info *fi)
 {
 	int res;
-
-	char *new_path = process_path(path);
-	int fd = open(new_path, fi->flags);
-
-	res = pwrite(fd, buf, size, offset);
+	res = pwrite(fi->fh, buf, size, offset);
 	if (res == -1)
 	{
+		res = -errno;
 	}
-	res = -errno;
-
-	close(fd);
-	free(new_path);
-
 	return res;
 }
 
