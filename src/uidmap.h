@@ -13,7 +13,8 @@ typedef enum UidStatus
   uid_not_found = 1,
   uid_error = 2,
   uid_root = 3,
-  uid_other = 4
+  uid_other = 4,
+  no_link = 5
 } UidStatus;
 
 int get_user(uid_t uid, char *sb_path, char *result);

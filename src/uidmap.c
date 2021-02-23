@@ -56,11 +56,21 @@ int get_user(uid_t uid, char *sb_path, char *result)
     if (len != -1)
     {
         buff[len] = '\0';
-        printf("RESULT: %s", buff);
+        printf("RESULT: %s\n", buff);
+
+        // The actual directory might not exist -- double-check it is there
+        int res = access(buff, R_OK);
+
+        // Doesn't exists -- return no_link
+        if (res < 0)
+        {
+            printf("Doesn't exist (uidmap): %s\n", buff);
+            return no_link;
+        }
+
         strcpy(result, buff);
         return uid_ok;
     }
 
-    // printf("STRING TOO LONG!\n");
-    return -errno;
+    return no_link;
 }

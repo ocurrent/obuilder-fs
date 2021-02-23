@@ -13,6 +13,7 @@
 
 #define FUSE_USE_VERSION 26
 #define HAVE_SETXATTR 1
+#define _DARWIN_BETTER_REALPATH
 
 #define DEBUG
 
@@ -42,6 +43,7 @@
 #include <fuse.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -79,21 +81,37 @@ and
 #define XATTR_APPLE_PREFIX "com.apple."
 
 #endif /* __APPLE__ */
+/* Apple Structs */
+#ifdef __APPLE__
+#include <sys/param.h>
+#define G_PREFIX "org"
+#define G_KAUTH_FILESEC_XATTR G_PREFIX ".apple.system.Security"
+#define A_PREFIX "com"
+#define A_KAUTH_FILESEC_XATTR A_PREFIX ".apple.system.Security"
+#define XATTR_APPLE_PREFIX "com.apple."
+		int
+		flock(int fd, int operation);
+#endif
 
-		static char root_dest[1024];
+static char root_dest[1024];
 
 static struct Conf
 {
 	char *scoreboard; // The path to the readlink scoreboard
 } conf;
 
-char *
-process_path(const char *path)
+char *process_path(const char *path, bool resolve_symlinks)
 {
 	char result[256];
 	struct fuse_context *fc = fuse_get_context();
 	int status = get_user(fc->uid, conf.scoreboard, result);
-	DEBUG_PRINT(("RESULT %s for UID %i\n", result, fc->uid));
+	DEBUG_PRINT(("RESULT %s for UID %i (status: %i)\n", result, fc->uid, status));
+
+	// Status 5 -- readlink failed, return a directory we are sure exists
+	if (status == no_link)
+	{
+		return strdup(conf.scoreboard);
+	}
 
 	if (status == uid_error || status == uid_not_found)
 	{
@@ -102,8 +120,9 @@ process_path(const char *path)
 
 	if (status == uid_ok)
 	{
+		// There's probably a defined length to be using somewhere
 		char userpath[2048];
-		DEBUG_PRINT(("Initial path is: %s\n", userpath));
+		DEBUG_PRINT(("Initial path is: %s\n Path is: %s\n", userpath, path));
 		strcpy(userpath, result);
 		DEBUG_PRINT(("Userpath is: %s\n", userpath));
 		strcat(userpath, "/local");
@@ -111,7 +130,34 @@ process_path(const char *path)
 		// Record this in the settings
 		strcpy(root_dest, userpath);
 
-		// Add the rest of the path
+		// Resolve symlinks
+		if (resolve_symlinks)
+		{
+			DEBUG_PRINT(("PATH IS %s\n", path));
+
+			strcat(userpath, path);
+			DEBUG_PRINT(("Processed path is: %s\n", userpath));
+			char *resolved;
+
+			resolved = realpath(userpath, NULL);
+			// Add the resolved path
+			if (resolved == NULL)
+			{
+				if (errno == ENOENT)
+				{
+					DEBUG_PRINT(("Processed path is: %s\n", userpath));
+					return strdup(userpath);
+				}
+			}
+			else
+			{
+				DEBUG_PRINT(("Processed path is: %s\n", userpath));
+				free(resolved);
+				return strdup(resolved);
+			}
+		}
+
+		// No symlink resolution -- Add the rest of the path
 		DEBUG_PRINT(("PATH IS %s\n", path));
 
 		strcat(userpath, path);
@@ -121,30 +167,54 @@ process_path(const char *path)
 	else
 	{
 		// HACK: Copy what hopefully was the last calling User location
-		// provided this was used correctly... i.e. only one user at a time
-		// can mix normal and sudo calls.
-		// get_pid_info(fc->pid); // Prints useful info, TODO: remove
 		char userpath[2048];
 		DEBUG_PRINT(("Root destination path is: %s\n", root_dest));
+
+		int acc = access(root_dest, R_OK);
+
+		if (acc != 0)
+		{
+			return strdup(path);
+		}
+
 		strcpy(userpath, root_dest);
 		strcat(userpath, path);
 		DEBUG_PRINT(("Together destination path is: %s\n", userpath));
+
+		// Double check it still exists
+		int res = access(userpath, R_OK);
+
+		// Doesn't exist -- return null
+		if (res < 0)
+		{
+			printf("Doesn't exist (obuilderfs): %s\n", userpath);
+			return strdup(path);
+		}
+
 		return strdup(userpath);
 	}
 }
 
-static int xmp_getattr(const char *path, struct stat *stbuf)
+static int obuilder_getattr(const char *path, struct stat *stbuf)
 {
 	int res;
 
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to resolve attr for %s\n", path));
+		return -errno;
+	}
 
 	DEBUG_PRINT(("Getting attributes for %s but really %s\n", path, new_path));
 
 	res = lstat(new_path, stbuf);
+
 	if (res == -1)
 	{
 		free(new_path);
+		DEBUG_PRINT(("lstat failed for %s but really %s\n", path, new_path));
 		return -errno;
 	}
 
@@ -152,30 +222,31 @@ static int xmp_getattr(const char *path, struct stat *stbuf)
 	return 0;
 }
 
-static int xmp_fgetattr(const char *path, struct stat *stbuf,
-												struct fuse_file_info *fi)
+static int obuilder_fgetattr(const char *path, struct stat *stbuf,
+														 struct fuse_file_info *fi)
 {
 	int res;
+	char *real_path;
 
-	(void)path;
-
-	char filePath[PATH_MAX];
-	if (fcntl(fi->fh, F_GETPATH, filePath) != -1)
-	{
-		DEBUG_PRINT(("PATH: %s\n", filePath));
-	}
-	// Do we need to use path or file handle?
-	res = fstat(fi->fh, stbuf);
-	if (res == -1)
+	real_path = process_path(path, false);
+	if (real_path == NULL)
 		return -errno;
 
-	return 0;
+	res = fstat(fi->fh, stbuf);
+
+	if (res == -1)
+	{
+		free(real_path);
+		return -errno;
+	}
+	free(real_path);
+	return res;
 }
 
-static int xmp_access(const char *path, int mask)
+static int obuilder_access(const char *path, int mask)
 {
 	int res;
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
 	res = access(new_path, mask);
 	if (res == -1)
 	{
@@ -187,10 +258,11 @@ static int xmp_access(const char *path, int mask)
 	return 0;
 }
 
-static int xmp_readlink(const char *path, char *buf, size_t size)
+static int obuilder_readlink(const char *path, char *buf, size_t size)
 {
 	int res;
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+	DEBUG_PRINT(("READING LINK %s and got %s\n", path, new_path));
 	res = readlink(new_path, buf, size - 1);
 	if (res == -1)
 	{
@@ -203,25 +275,25 @@ static int xmp_readlink(const char *path, char *buf, size_t size)
 	return 0;
 }
 
-struct xmp_dirp
+struct obuilder_dirp
 {
 	DIR *dp;
 	struct dirent *entry;
 	off_t offset;
 };
 
-static inline struct xmp_dirp *get_dirp(struct fuse_file_info *fi)
+static inline struct obuilder_dirp *get_dirp(struct fuse_file_info *fi)
 {
-	return (struct xmp_dirp *)(uintptr_t)fi->fh;
+	return (struct obuilder_dirp *)(uintptr_t)fi->fh;
 }
 
-static int xmp_opendir(const char *path, struct fuse_file_info *fi)
+static int obuilder_opendir(const char *path, struct fuse_file_info *fi)
 {
 	int res;
 
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
 
-	struct xmp_dirp *d = malloc(sizeof(struct xmp_dirp));
+	struct obuilder_dirp *d = malloc(sizeof(struct obuilder_dirp));
 	if (d == NULL)
 		return -ENOMEM;
 
@@ -241,8 +313,8 @@ static int xmp_opendir(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-											 off_t offset, struct fuse_file_info *fi)
+static int obuilder_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+														off_t offset, struct fuse_file_info *fi)
 {
 	DIR *dp;
 	struct dirent *de;
@@ -250,7 +322,7 @@ static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	(void)offset;
 	(void)fi;
 
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
 
 	dp = opendir(new_path);
 	if (dp == NULL)
@@ -274,19 +346,19 @@ static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	return 0;
 }
 
-static int xmp_releasedir(const char *path, struct fuse_file_info *fi)
+static int obuilder_releasedir(const char *path, struct fuse_file_info *fi)
 {
-	struct xmp_dirp *d = get_dirp(fi);
+	struct obuilder_dirp *d = get_dirp(fi);
 	(void)path;
 	closedir(d->dp);
 	free(d);
 	return 0;
 }
 
-static int xmp_mknod(const char *path, mode_t mode, dev_t rdev)
+static int obuilder_mknod(const char *path, mode_t mode, dev_t rdev)
 {
 	int res;
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
 
 	if (S_ISFIFO(mode))
 		res = mkfifo(new_path, mode);
@@ -303,10 +375,10 @@ static int xmp_mknod(const char *path, mode_t mode, dev_t rdev)
 	return 0;
 }
 
-static int xmp_mkdir(const char *path, mode_t mode)
+static int obuilder_mkdir(const char *path, mode_t mode)
 {
 	int res;
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
 	res = mkdir(new_path, mode);
 	if (res == -1)
 	{
@@ -318,41 +390,70 @@ static int xmp_mkdir(const char *path, mode_t mode)
 	return 0;
 }
 
-static int xmp_unlink(const char *path)
+static int delete_file(const char *path, int (*target_delete_func)(const char *))
 {
 	int res;
-	char *new_path = process_path(path);
-	res = unlink(new_path);
-	if (res == -1)
+	char *real_path;
+	struct stat st;
+	char *also_try_delete = NULL;
+	// char *unlink_first = NULL;
+	int (*main_delete_func)(const char *) = target_delete_func;
+
+	real_path = process_path(path, false);
+	if (real_path == NULL)
 	{
-		free(new_path);
+		DEBUG_PRINT(("FAILED TO GET REAL PATH %s\n", path));
 		return -errno;
 	}
 
-	free(new_path);
-	return 0;
-}
-
-static int xmp_rmdir(const char *path)
-{
-	int res;
-	char *new_path = process_path(path);
-	res = rmdir(new_path);
-	if (res == -1)
+	if (lstat(real_path, &st) == -1)
 	{
-		free(new_path);
+		free(real_path);
 		return -errno;
 	}
 
-	free(new_path);
+	if (S_ISLNK(st.st_mode))
+	{
+		main_delete_func = &unlink;
+	}
+
+	res = main_delete_func(real_path);
+	free(real_path);
+	if (res == -1)
+	{
+		free(also_try_delete);
+		return -errno;
+	}
+
+	if (also_try_delete != NULL)
+	{
+		(void)target_delete_func(also_try_delete);
+		free(also_try_delete);
+	}
+
 	return 0;
 }
 
-static int xmp_symlink(const char *from, const char *to)
+static int obuilder_unlink(const char *path)
+{
+	return delete_file(path, &unlink);
+}
+
+static int obuilder_rmdir(const char *path)
+{
+	return delete_file(path, &rmdir);
+}
+
+static int obuilder_symlink(const char *from, const char *to)
 {
 	int res;
 
-	char *new_to = process_path(to);
+	char *new_to = process_path(to, false);
+	if (new_to == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for symlinking\n", new_to));
+		return -errno;
+	}
 
 	res = symlink(from, new_to);
 	if (res == -1)
@@ -364,11 +465,20 @@ static int xmp_symlink(const char *from, const char *to)
 	return 0;
 }
 
-static int xmp_rename(const char *from, const char *to)
+static int obuilder_rename(const char *from, const char *to)
 {
 	int res;
-	char *new_from = process_path(from);
-	char *new_to = process_path(to);
+
+	char *new_from = process_path(from, false);
+	if (new_from == NULL)
+		return -errno;
+
+	char *new_to = process_path(to, false);
+	if (new_to == NULL)
+	{
+		free(new_from);
+		return -errno;
+	}
 
 	res = rename(new_from, new_to);
 
@@ -386,18 +496,24 @@ static int xmp_rename(const char *from, const char *to)
 
 #ifdef __APPLE__
 
-static int xmp_setvolname(const char *volname)
+static int obuilder_setvolname(const char *volname)
 {
 	(void)volname;
 	return 0;
 }
 
-static int xmp_exchange(const char *path1, const char *path2,
-												unsigned long options)
+static int obuilder_exchange(const char *path1, const char *path2,
+														 unsigned long options)
 {
 	int res;
-	char *new_path1 = process_path(path1);
-	char *new_path2 = process_path(path2);
+	char *new_path1 = process_path(path1, false);
+	char *new_path2 = process_path(path2, false);
+
+	if (new_path1 == NULL || new_path2 == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s or %s for exchanging\n", path1, path2));
+		return -errno;
+	}
 
 	res = exchangedata(new_path1, new_path2, options);
 	if (res == -1)
@@ -415,12 +531,18 @@ static int xmp_exchange(const char *path1, const char *path2,
 
 #endif /* __APPLE__ */
 
-static int xmp_link(const char *from, const char *to)
+static int obuilder_link(const char *from, const char *to)
 {
 	int res;
 
-	char *new_from = process_path(from);
-	char *new_to = process_path(to);
+	char *new_from = process_path(from, false);
+	char *new_to = process_path(to, false);
+
+	if (new_from == NULL || new_to == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s or %s for linking\n", new_from, new_to));
+		return -errno;
+	}
 
 	res = link(new_from, new_to);
 	if (res == -1)
@@ -436,307 +558,15 @@ static int xmp_link(const char *from, const char *to)
 	return 0;
 }
 
-#ifdef __APPLE__
-
-static int xmp_fsetattr_x(const char *path, struct setattr_x *attr,
-													struct fuse_file_info *fi)
+static int obuilder_chmod(const char *path, mode_t mode)
 {
 	int res;
-	uid_t uid = -1;
-	gid_t gid = -1;
-
-	char *new_path = process_path(path);
-
-	if (SETATTR_WANTS_MODE(attr))
+	char *new_path = process_path(path, false);
+	if (new_path == NULL)
 	{
-		res = lchmod(new_path, attr->mode);
-		if (res == -1)
-		{
-			free(new_path);
-			return -errno;
-		}
-	}
-
-	if (SETATTR_WANTS_UID(attr))
-		uid = attr->uid;
-
-	if (SETATTR_WANTS_GID(attr))
-		gid = attr->gid;
-
-	if ((uid != -1) || (gid != -1))
-	{
-		res = lchown(new_path, uid, gid);
-		if (res == -1)
-		{
-			free(new_path);
-			return -errno;
-		}
-	}
-
-	if (SETATTR_WANTS_SIZE(attr))
-	{
-		if (fi)
-			res = ftruncate(fi->fh, attr->size);
-		else
-			res = truncate(new_path, attr->size);
-		if (res == -1)
-		{
-			free(new_path);
-			return -errno;
-		}
-	}
-
-	if (SETATTR_WANTS_MODTIME(attr))
-	{
-		struct timeval tv[2];
-		if (!SETATTR_WANTS_ACCTIME(attr))
-			gettimeofday(&tv[0], NULL);
-		else
-		{
-			tv[0].tv_sec = attr->acctime.tv_sec;
-			tv[0].tv_usec = attr->acctime.tv_nsec / 1000;
-		}
-		tv[1].tv_sec = attr->modtime.tv_sec;
-		tv[1].tv_usec = attr->modtime.tv_nsec / 1000;
-		res = utimes(new_path, tv);
-		if (res == -1)
-		{
-			free(new_path);
-			return -errno;
-		}
-	}
-
-	if (SETATTR_WANTS_CRTIME(attr))
-	{
-		struct attrlist attributes;
-
-		attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
-		attributes.reserved = 0;
-		attributes.commonattr = ATTR_CMN_CRTIME;
-		attributes.dirattr = 0;
-		attributes.fileattr = 0;
-		attributes.forkattr = 0;
-		attributes.volattr = 0;
-
-		res = setattrlist(new_path, &attributes, &attr->crtime,
-											sizeof(struct timespec), FSOPT_NOFOLLOW);
-
-		if (res == -1)
-		{
-			free(new_path);
-			return -errno;
-		}
-	}
-
-	if (SETATTR_WANTS_CHGTIME(attr))
-	{
-		struct attrlist attributes;
-
-		attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
-		attributes.reserved = 0;
-		attributes.commonattr = ATTR_CMN_CHGTIME;
-		attributes.dirattr = 0;
-		attributes.fileattr = 0;
-		attributes.forkattr = 0;
-		attributes.volattr = 0;
-
-		res = setattrlist(new_path, &attributes, &attr->chgtime,
-											sizeof(struct timespec), FSOPT_NOFOLLOW);
-
-		if (res == -1)
-		{
-			free(new_path);
-			return -errno;
-		}
-	}
-
-	if (SETATTR_WANTS_BKUPTIME(attr))
-	{
-		struct attrlist attributes;
-
-		attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
-		attributes.reserved = 0;
-		attributes.commonattr = ATTR_CMN_BKUPTIME;
-		attributes.dirattr = 0;
-		attributes.fileattr = 0;
-		attributes.forkattr = 0;
-		attributes.volattr = 0;
-
-		res = setattrlist(new_path, &attributes, &attr->bkuptime,
-											sizeof(struct timespec), FSOPT_NOFOLLOW);
-
-		if (res == -1)
-		{
-			free(new_path);
-			return -errno;
-		}
-	}
-
-	if (SETATTR_WANTS_FLAGS(attr))
-	{
-		res = chflags(new_path, attr->flags);
-		if (res == -1)
-		{
-			free(new_path);
-			return -errno;
-		}
-	}
-
-	return 0;
-}
-
-static int xmp_setattr_x(const char *path, struct setattr_x *attr)
-{
-	// xmp_fsetattr_x already changes the path
-	return xmp_fsetattr_x(path, attr, (struct fuse_file_info *)0);
-}
-
-static int xmp_chflags(const char *path, uint32_t flags)
-{
-	int res;
-
-	char *new_path = process_path(path);
-
-	res = chflags(new_path, flags);
-
-	if (res == -1)
-	{
-		free(new_path);
+		DEBUG_PRINT(("Failed to get %s for chmoding\n", new_path));
 		return -errno;
 	}
-
-	free(new_path);
-	return 0;
-}
-
-static int xmp_getxtimes(const char *path, struct timespec *bkuptime,
-												 struct timespec *crtime)
-{
-	int res = 0;
-	struct attrlist attributes;
-
-	attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
-	attributes.reserved = 0;
-	attributes.commonattr = 0;
-	attributes.dirattr = 0;
-	attributes.fileattr = 0;
-	attributes.forkattr = 0;
-	attributes.volattr = 0;
-
-	char *new_path = process_path(path);
-
-	struct xtimeattrbuf
-	{
-		uint32_t size;
-		struct timespec xtime;
-	} __attribute__((packed));
-
-	struct xtimeattrbuf buf;
-
-	attributes.commonattr = ATTR_CMN_BKUPTIME;
-	res = getattrlist(new_path, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
-	if (res == 0)
-		(void)memcpy(bkuptime, &(buf.xtime), sizeof(struct timespec));
-	else
-		(void)memset(bkuptime, 0, sizeof(struct timespec));
-
-	attributes.commonattr = ATTR_CMN_CRTIME;
-	res = getattrlist(new_path, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
-	if (res == 0)
-		(void)memcpy(crtime, &(buf.xtime), sizeof(struct timespec));
-	else
-		(void)memset(crtime, 0, sizeof(struct timespec));
-
-	free(new_path);
-	return 0;
-}
-
-static int xmp_setbkuptime(const char *path, const struct timespec *bkuptime)
-{
-	int res;
-
-	struct attrlist attributes;
-	char *new_path = process_path(path);
-
-	attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
-	attributes.reserved = 0;
-	attributes.commonattr = ATTR_CMN_BKUPTIME;
-	attributes.dirattr = 0;
-	attributes.fileattr = 0;
-	attributes.forkattr = 0;
-	attributes.volattr = 0;
-
-	res = setattrlist(new_path, &attributes, (void *)bkuptime,
-										sizeof(struct timespec), FSOPT_NOFOLLOW);
-
-	if (res == -1)
-	{
-	}
-
-	return 0;
-}
-
-static int xmp_setchgtime(const char *path, const struct timespec *chgtime)
-{
-	int res;
-
-	struct attrlist attributes;
-	char *new_path = process_path(path);
-
-	attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
-	attributes.reserved = 0;
-	attributes.commonattr = ATTR_CMN_CHGTIME;
-	attributes.dirattr = 0;
-	attributes.fileattr = 0;
-	attributes.forkattr = 0;
-	attributes.volattr = 0;
-
-	res = setattrlist(new_path, &attributes, (void *)chgtime,
-										sizeof(struct timespec), FSOPT_NOFOLLOW);
-
-	if (res == -1)
-	{
-		free(new_path);
-		return -errno;
-	}
-
-	return 0;
-}
-
-static int xmp_setcrtime(const char *path, const struct timespec *crtime)
-{
-	int res;
-
-	struct attrlist attributes;
-	char *new_path = process_path(path);
-
-	attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
-	attributes.reserved = 0;
-	attributes.commonattr = ATTR_CMN_CRTIME;
-	attributes.dirattr = 0;
-	attributes.fileattr = 0;
-	attributes.forkattr = 0;
-	attributes.volattr = 0;
-
-	res = setattrlist(new_path, &attributes, (void *)crtime,
-										sizeof(struct timespec), FSOPT_NOFOLLOW);
-
-	if (res == -1)
-	{
-		free(new_path);
-		return -errno;
-	}
-
-	free(new_path);
-	return 0;
-}
-
-#endif /* __APPLE__ */
-
-static int xmp_chmod(const char *path, mode_t mode)
-{
-	int res;
-	char *new_path = process_path(path);
 
 #ifdef __APPLE__
 	res = lchmod(new_path, mode);
@@ -753,10 +583,15 @@ static int xmp_chmod(const char *path, mode_t mode)
 	return 0;
 }
 
-static int xmp_chown(const char *path, uid_t uid, gid_t gid)
+static int obuilder_chown(const char *path, uid_t uid, gid_t gid)
 {
 	int res;
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for chowning\n", new_path));
+		return -errno;
+	}
 
 	res = lchown(new_path, uid, gid);
 	if (res == -1)
@@ -768,10 +603,16 @@ static int xmp_chown(const char *path, uid_t uid, gid_t gid)
 	return 0;
 }
 
-static int xmp_truncate(const char *path, off_t size)
+static int obuilder_truncate(const char *path, off_t size)
 {
 	int res;
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for truncating\n", new_path));
+		return -errno;
+	}
 
 	res = truncate(new_path, size);
 	if (res == -1)
@@ -783,8 +624,8 @@ static int xmp_truncate(const char *path, off_t size)
 	return 0;
 }
 
-static int xmp_ftruncate(const char *path, off_t size,
-												 struct fuse_file_info *fi)
+static int obuilder_ftruncate(const char *path, off_t size,
+															struct fuse_file_info *fi)
 {
 	int res;
 
@@ -798,27 +639,39 @@ static int xmp_ftruncate(const char *path, off_t size,
 	return 0;
 }
 
-static int xmp_utimens(const char *path, const struct timespec ts[2])
+static int obuilder_utimens(const char *path, const struct timespec ts[2])
 {
-	int res;
+	// int res;
 	return 0;
 
-	char *new_path = process_path(path);
-	/* don't use utime/utimes since they follow symlinks */
-	res = utimensat(0, new_path, ts, AT_SYMLINK_NOFOLLOW);
-	if (res == -1)
-	{
-		free(new_path);
-		return -errno;
-	}
+	// char *new_path = process_path(path, true);
 
+	// struct timeval tv[2];
+	// tv[0].tv_sec = ts[0].tv_sec;
+	// tv[0].tv_usec = ts[0].tv_nsec / 1000;
+	// tv[1].tv_sec = ts[1].tv_sec;
+	// tv[1].tv_usec = ts[1].tv_nsec / 1000;
+	// res = lutimes(new_path, tv);
+	// if (res == -1)
+	// {
+	// 	free(new_path);
+	// 	return -errno;
+	// }
+
+	// free(new_path);
 	return 0;
 }
 
-static int xmp_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+static int obuilder_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
 	int fd;
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for creating\n", new_path));
+		return -errno;
+	}
 
 	fd = open(new_path, fi->flags, mode);
 	if (fd == -1)
@@ -832,10 +685,16 @@ static int xmp_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 	return 0;
 }
 
-static int xmp_open(const char *path, struct fuse_file_info *fi)
+static int obuilder_open(const char *path, struct fuse_file_info *fi)
 {
 	int fd;
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for opening\n", new_path));
+		return -errno;
+	}
 
 	fd = open(new_path, fi->flags);
 	if (fd == -1)
@@ -849,11 +708,23 @@ static int xmp_open(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
-										struct fuse_file_info *fi)
+static int obuilder_read(const char *path, char *buf, size_t size, off_t offset,
+												 struct fuse_file_info *fi)
 {
 	int res;
-	res = pread(fi->fh, buf, size, offset);
+
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for reading\n", new_path));
+		return -errno;
+	}
+
+	int fd = open(new_path, fi->flags);
+	// File handle okay?
+	res = pread(fd, buf, size, offset);
+  
 	if (res == -1)
 	{
 		res = -errno;
@@ -861,8 +732,8 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
 	return res;
 }
 
-static int xmp_read_buf(const char *path, struct fuse_bufvec **bufp,
-												size_t size, off_t offset, struct fuse_file_info *fi)
+static int obuilder_read_buf(const char *path, struct fuse_bufvec **bufp,
+														 size_t size, off_t offset, struct fuse_file_info *fi)
 {
 	struct fuse_bufvec *src;
 
@@ -883,11 +754,23 @@ static int xmp_read_buf(const char *path, struct fuse_bufvec **bufp,
 	return 0;
 }
 
-static int xmp_write(const char *path, const char *buf, size_t size,
-										 off_t offset, struct fuse_file_info *fi)
+static int obuilder_write(const char *path, const char *buf, size_t size,
+													off_t offset, struct fuse_file_info *fi)
 {
 	int res;
-	res = pwrite(fi->fh, buf, size, offset);
+
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for writing\n", new_path));
+		return -errno;
+	}
+
+	int fd = open(new_path, fi->flags);
+
+	res = pwrite(fd, buf, size, offset);
+
 	if (res == -1)
 	{
 		res = -errno;
@@ -895,8 +778,8 @@ static int xmp_write(const char *path, const char *buf, size_t size,
 	return res;
 }
 
-static int xmp_write_buf(const char *path, struct fuse_bufvec *buf,
-												 off_t offset, struct fuse_file_info *fi)
+static int obuilder_write_buf(const char *path, struct fuse_bufvec *buf,
+															off_t offset, struct fuse_file_info *fi)
 {
 	struct fuse_bufvec dst = FUSE_BUFVEC_INIT(fuse_buf_size(buf));
 
@@ -909,11 +792,17 @@ static int xmp_write_buf(const char *path, struct fuse_bufvec *buf,
 	return fuse_buf_copy(&dst, buf, FUSE_BUF_SPLICE_NONBLOCK);
 }
 
-static int xmp_statfs(const char *path, struct statvfs *stbuf)
+static int obuilder_statfs(const char *path, struct statvfs *stbuf)
 {
 	int res;
 
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for statfs-ing\n", new_path));
+		return -errno;
+	}
 
 	res = statvfs(new_path, stbuf);
 	if (res == -1)
@@ -926,7 +815,7 @@ static int xmp_statfs(const char *path, struct statvfs *stbuf)
 	return 0;
 }
 
-static int xmp_flush(const char *path, struct fuse_file_info *fi)
+static int obuilder_flush(const char *path, struct fuse_file_info *fi)
 {
 	int res;
 
@@ -943,7 +832,7 @@ static int xmp_flush(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-static int xmp_release(const char *path, struct fuse_file_info *fi)
+static int obuilder_release(const char *path, struct fuse_file_info *fi)
 {
 	(void)path;
 	close(fi->fh);
@@ -951,8 +840,8 @@ static int xmp_release(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-static int xmp_fsync(const char *path, int isdatasync,
-										 struct fuse_file_info *fi)
+static int obuilder_fsync(const char *path, int isdatasync,
+													struct fuse_file_info *fi)
 {
 	int res;
 	(void)path;
@@ -972,8 +861,8 @@ static int xmp_fsync(const char *path, int isdatasync,
 }
 
 #if defined(HAVE_POSIX_FALLOCATE) || defined(__APPLE__)
-static int xmp_fallocate(const char *path, int mode,
-												 off_t offset, off_t length, struct fuse_file_info *fi)
+static int obuilder_fallocate(const char *path, int mode,
+															off_t offset, off_t length, struct fuse_file_info *fi)
 {
 #ifdef __APPLE__
 	fstore_t fstore;
@@ -1013,16 +902,23 @@ static int xmp_fallocate(const char *path, int mode,
 #ifdef HAVE_SETXATTR
 /* xattr operations are optional and can safely be left unimplemented */
 #ifdef __APPLE__
-static int xmp_setxattr(const char *path, const char *name, const char *value,
-												size_t size, int flags, uint32_t position)
+static int obuilder_setxattr(const char *path, const char *name, const char *value,
+														 size_t size, int flags, uint32_t position)
 #else
-static int xmp_setxattr(const char *path, const char *name, const char *value,
-												size_t size, int flags)
+static int obuilder_setxattr(const char *path, const char *name, const char *value,
+														 size_t size, int flags)
 #endif
 {
 #ifdef __APPLE__
 	int res;
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for setattrx-ing\n", new_path));
+		return -errno;
+	}
+
 	if (!strncmp(name, XATTR_APPLE_PREFIX, sizeof(XATTR_APPLE_PREFIX) - 1))
 	{
 		flags &= ~(XATTR_NOSECURITY);
@@ -1051,16 +947,23 @@ static int xmp_setxattr(const char *path, const char *name, const char *value,
 }
 
 #ifdef __APPLE__
-static int xmp_getxattr(const char *path, const char *name, char *value,
-												size_t size, uint32_t position)
+static int obuilder_getxattr(const char *path, const char *name, char *value,
+														 size_t size, uint32_t position)
 #else
-static int xmp_getxattr(const char *path, const char *name, char *value,
-												size_t size)
+static int obuilder_getxattr(const char *path, const char *name, char *value,
+														 size_t size)
 #endif
 {
 #ifdef __APPLE__
 	int res;
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for getattrx-ing\n", new_path));
+		return -errno;
+	}
+
 	if (strcmp(name, A_KAUTH_FILESEC_XATTR) == 0)
 	{
 		char new_name[MAXPATHLEN];
@@ -1085,10 +988,16 @@ static int xmp_getxattr(const char *path, const char *name, char *value,
 	return res;
 }
 
-static int xmp_listxattr(const char *path, char *list, size_t size)
+static int obuilder_listxattr(const char *path, char *list, size_t size)
 {
 #ifdef __APPLE__
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for listxattr-ing\n", new_path));
+		return -errno;
+	}
 	ssize_t res = listxattr(new_path, list, size, XATTR_NOFOLLOW);
 	if (res > 0)
 	{
@@ -1133,11 +1042,18 @@ static int xmp_listxattr(const char *path, char *list, size_t size)
 	return res;
 }
 
-static int xmp_removexattr(const char *path, const char *name)
+static int obuilder_removexattr(const char *path, const char *name)
 {
 #ifdef __APPLE__
 	int res;
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for removeattr-ing\n", new_path));
+		return -errno;
+	}
+
 	if (strcmp(name, A_KAUTH_FILESEC_XATTR) == 0)
 	{
 		char new_name[MAXPATHLEN];
@@ -1163,10 +1079,17 @@ static int xmp_removexattr(const char *path, const char *name)
 }
 #endif /* HAVE_SETXATTR */
 
-static int xmp_lock(const char *path, struct fuse_file_info *fi, int cmd,
-										struct flock *lock)
+static int obuilder_lock(const char *path, struct fuse_file_info *fi, int cmd,
+												 struct flock *lock)
 {
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for locking\n", new_path));
+		return -errno;
+	}
+
 	int fd = open(new_path, fi->flags);
 
 	int res;
@@ -1182,9 +1105,16 @@ static int xmp_lock(const char *path, struct fuse_file_info *fi, int cmd,
 	return res;
 }
 
-static int xmp_flock(const char *path, struct fuse_file_info *fi, int op)
+static int obuilder_flock(const char *path, struct fuse_file_info *fi, int op)
 {
-	char *new_path = process_path(path);
+	char *new_path = process_path(path, false);
+
+	if (new_path == NULL)
+	{
+		DEBUG_PRINT(("Failed to get %s for flocking\n", new_path));
+		return -errno;
+	}
+
 	int fd = open(new_path, fi->flags);
 
 	int res;
@@ -1203,7 +1133,7 @@ static int xmp_flock(const char *path, struct fuse_file_info *fi, int op)
 }
 
 void *
-xmp_init(struct fuse_conn_info *conn)
+obuilder_init(struct fuse_conn_info *conn)
 {
 #ifdef __APPLE__
 	FUSE_ENABLE_SETVOLNAME(conn);
@@ -1212,65 +1142,66 @@ xmp_init(struct fuse_conn_info *conn)
 	return NULL;
 }
 
-void xmp_destroy(void *userdata)
+void obuilder_destroy(void *userdata)
 {
 }
 
-static struct fuse_operations xmp_oper = {
-		.init = xmp_init,
-		.destroy = xmp_destroy,
-		.getattr = xmp_getattr,
-		.fgetattr = xmp_fgetattr,
-		.access = xmp_access,
-		.readlink = xmp_readlink,
-		.opendir = xmp_opendir,
-		.readdir = xmp_readdir,
-		.releasedir = xmp_releasedir,
-		.mknod = xmp_mknod,
-		.mkdir = xmp_mkdir,
-		.symlink = xmp_symlink,
-		.unlink = xmp_unlink,
-		.rmdir = xmp_rmdir,
-		.rename = xmp_rename,
-		.link = xmp_link,
-		.chmod = xmp_chmod,
-		.chown = xmp_chown,
-		.truncate = xmp_truncate,
-		.ftruncate = xmp_ftruncate,
-		.utimens = xmp_utimens,
-		.create = xmp_create,
-		.open = xmp_open,
-		.read = xmp_read,
-		.read_buf = xmp_read_buf,
-		.write = xmp_write,
-		.write_buf = xmp_write_buf,
-		.statfs = xmp_statfs,
-		.flush = xmp_flush,
-		.release = xmp_release,
-		.fsync = xmp_fsync,
+static struct fuse_operations obuilder_oper = {
+		.init = obuilder_init,
+		.destroy = obuilder_destroy,
+		.getattr = obuilder_getattr,
+		.fgetattr = obuilder_fgetattr,
+		.access = obuilder_access,
+		.readlink = obuilder_readlink,
+		.opendir = obuilder_opendir,
+		.readdir = obuilder_readdir,
+		.releasedir = obuilder_releasedir,
+		.mknod = obuilder_mknod,
+		.mkdir = obuilder_mkdir,
+		.symlink = obuilder_symlink,
+		.unlink = obuilder_unlink,
+		.rmdir = obuilder_rmdir,
+		.rename = obuilder_rename,
+		.link = obuilder_link,
+		.chmod = obuilder_chmod,
+		.chown = obuilder_chown,
+		.truncate = obuilder_truncate,
+		.ftruncate = obuilder_ftruncate,
+		.utimens = obuilder_utimens,
+		.create = obuilder_create,
+		.open = obuilder_open,
+		.read = obuilder_read,
+		.read_buf = obuilder_read_buf,
+		.write = obuilder_write,
+		.write_buf = obuilder_write_buf,
+		.statfs = obuilder_statfs,
+		.flush = obuilder_flush,
+		.release = obuilder_release,
+		.fsync = obuilder_fsync,
 #if defined(HAVE_POSIX_FALLOCATE) || defined(__APPLE__)
-		.fallocate = xmp_fallocate,
+		.fallocate = obuilder_fallocate,
 #endif
 #ifdef HAVE_SETXATTR
-		.setxattr = xmp_setxattr,
-		.getxattr = xmp_getxattr,
-		.listxattr = xmp_listxattr,
-		.removexattr = xmp_removexattr,
+		.setxattr = obuilder_setxattr,
+		.getxattr = obuilder_getxattr,
+		.listxattr = obuilder_listxattr,
+		.removexattr = obuilder_removexattr,
 #endif
 		// NOT IMPLEMENTED BUT LEAVING ANYWAY
-		.lock = xmp_lock,
-		.flock = xmp_flock,
-#ifdef __APPLE__
-		.setvolname = xmp_setvolname,
-		.exchange = xmp_exchange,
-		.getxtimes = xmp_getxtimes,
-		.setbkuptime = xmp_setbkuptime,
-		.setchgtime = xmp_setchgtime,
-		.setcrtime = xmp_setcrtime,
-		.chflags = xmp_chflags,
-		.setattr_x = xmp_setattr_x,
-		.fsetattr_x = xmp_fsetattr_x,
-#endif
+		.lock = obuilder_lock,
+		.flock = obuilder_flock,
+
+		// These were causing issues: cp : lutimes ...
+		// Removed for now, might need to bring them back in the future
+		// .setvolname = obuilder_setvolname,
+		// .exchange = obuilder_exchange,
+		// .getxtimes = obuilder_getxtimes,
+		// .setbkuptime = obuilder_setbkuptime,
+		// .setchgtime = obuilder_setchgtime,
+		// .setcrtime = obuilder_setcrtime,
+		// .chflags = obuilder_chflags,
+		// .setattr_x = obuilder_setattr_x,
+		// .fsetattr_x = obuilder_fsetattr_x,
 		.flag_nullpath_ok = 1,
 		.flag_utime_omit_ok = 1};
 
@@ -1289,5 +1220,5 @@ int main(int argc, char *argv[])
 	printf("%s\n", conf.scoreboard);
 	// Replace scoreboard param with program name and pass this to fuse
 	*argv[1] = *argv[0];
-	return fuse_main(argc - 1, argv + 1, &xmp_oper, NULL);
+	return fuse_main(argc - 1, argv + 1, &obuilder_oper, NULL);
 }
