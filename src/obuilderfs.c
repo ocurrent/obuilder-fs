@@ -169,6 +169,14 @@ char *process_path(const char *path, bool resolve_symlinks)
 		// HACK: Copy what hopefully was the last calling User location
 		char userpath[2048];
 		DEBUG_PRINT(("Root destination path is: %s\n", root_dest));
+
+		int acc = access(root_dest, R_OK);
+
+		if (acc != 0)
+		{
+			return strdup(path);
+		}
+
 		strcpy(userpath, root_dest);
 		strcat(userpath, path);
 		DEBUG_PRINT(("Together destination path is: %s\n", userpath));
@@ -180,7 +188,7 @@ char *process_path(const char *path, bool resolve_symlinks)
 		if (res < 0)
 		{
 			printf("Doesn't exist (obuilderfs): %s\n", userpath);
-			return NULL;
+			return strdup(path);
 		}
 
 		return strdup(userpath);
