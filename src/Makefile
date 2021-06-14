@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall `pkg-config fuse --cflags --libs` 
+CFLAGS = -Wall `pkg-config fuse --cflags --libs` -D_FILE_OFFSET_BITS=64 
 LDFLAGS = 
 OBJFILES = obuilderfs.o uidmap.o
 TARGET = ../install/obuilderfs
