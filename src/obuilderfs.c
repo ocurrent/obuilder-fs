@@ -100,6 +100,18 @@ static struct Conf
 	char *scoreboard; // The path to the readlink scoreboard
 } conf;
 
+int chown_file(const char* path, struct fuse_context *fc, int (*chown_func)(const char*, uid_t, gid_t))
+{
+	int res;
+
+	res = chown_func(path, fc->uid, fc->gid);
+ 
+	if(res == -1)
+		return -errno;
+
+	return res;
+}
+
 char *process_path(const char *path, bool resolve_symlinks)
 {
 	char result[256];
@@ -181,16 +193,6 @@ char *process_path(const char *path, bool resolve_symlinks)
 		strcat(userpath, path);
 		DEBUG_PRINT(("Together destination path is: %s\n", userpath));
 
-		// Double check it still exists
-		int res = access(userpath, R_OK);
-
-		// Doesn't exist -- return null
-		if (res < 0)
-		{
-			printf("Doesn't exist (obuilderfs): %s\n", userpath);
-			return strdup(path);
-		}
-
 		return strdup(userpath);
 	}
 }
@@ -226,21 +228,16 @@ static int obuilder_fgetattr(const char *path, struct stat *stbuf,
 														 struct fuse_file_info *fi)
 {
 	int res;
-	char *real_path;
-
-	real_path = process_path(path, false);
-	if (real_path == NULL)
-		return -errno;
-
-	res = fstat(fi->fh, stbuf);
+        
+	DEBUG_PRINT(("Getting attributes (fgetattr) for %s\n", path));
+        res = fstat(fi->fh, stbuf);
 
 	if (res == -1)
 	{
-		free(real_path);
+		DEBUG_PRINT(("Fstat failed for %s\n", path));
 		return -errno;
 	}
-	free(real_path);
-	return res;
+	return 0;
 }
 
 static int obuilder_access(const char *path, int mask)
@@ -248,6 +245,7 @@ static int obuilder_access(const char *path, int mask)
 	int res;
 	char *new_path = process_path(path, false);
 	res = access(new_path, mask);
+        DEBUG_PRINT(("Accessing %s but actually  %s\n", path, new_path));
 	if (res == -1)
 	{
 		free(new_path);
@@ -266,7 +264,8 @@ static int obuilder_readlink(const char *path, char *buf, size_t size)
 	res = readlink(new_path, buf, size - 1);
 	if (res == -1)
 	{
-		free(new_path);
+		DEBUG_PRINT(("Readlink failed for %s but really %s\n", path, new_path));
+                free(new_path);
 		return -errno;
 	}
 
@@ -292,7 +291,7 @@ static int obuilder_opendir(const char *path, struct fuse_file_info *fi)
 	int res;
 
 	char *new_path = process_path(path, false);
-
+        DEBUG_PRINT(("Opening dir for %s but really %s\n", path, new_path));
 	struct obuilder_dirp *d = malloc(sizeof(struct obuilder_dirp));
 	if (d == NULL)
 		return -ENOMEM;
@@ -358,8 +357,9 @@ static int obuilder_releasedir(const char *path, struct fuse_file_info *fi)
 static int obuilder_mknod(const char *path, mode_t mode, dev_t rdev)
 {
 	int res;
+ 	struct fuse_context *fc;
 	char *new_path = process_path(path, false);
-
+	DEBUG_PRINT(("Making node for %s but really %s\n", path, new_path));
 	if (S_ISFIFO(mode))
 		res = mkfifo(new_path, mode);
 	else
@@ -371,23 +371,33 @@ static int obuilder_mknod(const char *path, mode_t mode, dev_t rdev)
 		return -errno;
 	}
 
+	fc = fuse_get_context();
+	res = chown_file(new_path, fc, &chown);
+
 	free(new_path);
-	return 0;
+	return res;
 }
 
 static int obuilder_mkdir(const char *path, mode_t mode)
 {
 	int res;
+ 	struct fuse_context *fc;
 	char *new_path = process_path(path, false);
 	res = mkdir(new_path, mode);
 	if (res == -1)
 	{
+                DEBUG_PRINT(("Mkdir failed for %s but really %s\n", path, new_path));
 		free(new_path);
 		return -errno;
 	}
+	
+	DEBUG_PRINT(("Made directory for %s but really %s\n", path, new_path));
+	
+	fc = fuse_get_context();
+	res = chown_file(new_path, fc, &chown);	
 
 	free(new_path);
-	return 0;
+	return res;
 }
 
 static int delete_file(const char *path, int (*target_delete_func)(const char *))
@@ -447,7 +457,8 @@ static int obuilder_rmdir(const char *path)
 static int obuilder_symlink(const char *from, const char *to)
 {
 	int res;
-
+	struct fuse_context *fc;
+        DEBUG_PRINT(("Symlink called for %s to %s\n", from, to));
 	char *new_to = process_path(to, false);
 	if (new_to == NULL)
 	{
@@ -458,11 +469,18 @@ static int obuilder_symlink(const char *from, const char *to)
 	res = symlink(from, new_to);
 	if (res == -1)
 	{
-		free(new_to);
+		DEBUG_PRINT(("Symlinking failed from %s to %s\n", from, new_to));
+                free(new_to);
 		return -errno;
 	}
+
+	DEBUG_PRINT(("SYMLINKING RESULT: %i\n", res));
+
+        // Sometimes it appears to get owned by root?!
+        fc = fuse_get_context();
+	res = chown_file(new_to, fc, &lchown);  
 	free(new_to);
-	return 0;
+	return res;
 }
 
 static int obuilder_rename(const char *from, const char *to)
@@ -479,7 +497,7 @@ static int obuilder_rename(const char *from, const char *to)
 		free(new_from);
 		return -errno;
 	}
-
+	DEBUG_PRINT(("Renaming for %s but really %s\n", new_from, new_to));
 	res = rename(new_from, new_to);
 
 	if (res == -1)
@@ -508,7 +526,7 @@ static int obuilder_exchange(const char *path1, const char *path2,
 	int res;
 	char *new_path1 = process_path(path1, false);
 	char *new_path2 = process_path(path2, false);
-
+	DEBUG_PRINT(("Exchanging for %s but really %s\n", new_path1, new_path2));
 	if (new_path1 == NULL || new_path2 == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s or %s for exchanging\n", path1, path2));
@@ -526,7 +544,7 @@ static int obuilder_exchange(const char *path1, const char *path2,
 	free(new_path1);
 	free(new_path2);
 
-	return 0;
+	return res;
 }
 
 #endif /* __APPLE__ */
@@ -537,10 +555,10 @@ static int obuilder_link(const char *from, const char *to)
 
 	char *new_from = process_path(from, false);
 	char *new_to = process_path(to, false);
-
+	DEBUG_PRINT(("Linking %s but really %s\n", new_from, new_to));
 	if (new_from == NULL || new_to == NULL)
 	{
-		DEBUG_PRINT(("Failed to get %s or %s for linking\n", new_from, new_to));
+		DEBUG_PRINT(("Failed to get %s or %s for linking\n", from, to));
 		return -errno;
 	}
 
@@ -562,6 +580,7 @@ static int obuilder_chmod(const char *path, mode_t mode)
 {
 	int res;
 	char *new_path = process_path(path, false);
+	DEBUG_PRINT(("Chmoding %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s for chmoding\n", new_path));
@@ -587,16 +606,18 @@ static int obuilder_chown(const char *path, uid_t uid, gid_t gid)
 {
 	int res;
 	char *new_path = process_path(path, false);
+	DEBUG_PRINT(("Chowing for %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
-		DEBUG_PRINT(("Failed to get %s for chowning\n", new_path));
+		DEBUG_PRINT(("Failed to get %s for chowning\n", path));
 		return -errno;
 	}
 
 	res = lchown(new_path, uid, gid);
 	if (res == -1)
 	{
-		free(new_path);
+		DEBUG_PRINT(("Chown failed for %s but really %s\n", path, new_path));
+                free(new_path);
 		return -errno;
 	}
 	free(new_path);
@@ -607,7 +628,7 @@ static int obuilder_truncate(const char *path, off_t size)
 {
 	int res;
 	char *new_path = process_path(path, false);
-
+        DEBUG_PRINT(("Truncating for %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s for truncating\n", new_path));
@@ -630,7 +651,7 @@ static int obuilder_ftruncate(const char *path, off_t size,
 	int res;
 
 	(void)path;
-
+	DEBUG_PRINT(("Ftruncating for %s\n", path));
 	// Using a file handle okay?
 	res = ftruncate(fi->fh, size);
 	if (res == -1)
@@ -641,32 +662,29 @@ static int obuilder_ftruncate(const char *path, off_t size,
 
 static int obuilder_utimens(const char *path, const struct timespec ts[2])
 {
-	// int res;
-	return 0;
+	int res;
 
-	// char *new_path = process_path(path, true);
+	/* don't use utime/utimes since they follow symlinks */
+        char *new_path = process_path(path, false);
+        DEBUG_PRINT(("Running utimens for %s but really %s\n", path, new_path));
+	if (new_path == NULL)
+         	return -errno;
+	
+	
+	res = utimensat(0, new_path, ts, AT_SYMLINK_NOFOLLOW);
+	if (res == -1)
+		return -errno;
 
-	// struct timeval tv[2];
-	// tv[0].tv_sec = ts[0].tv_sec;
-	// tv[0].tv_usec = ts[0].tv_nsec / 1000;
-	// tv[1].tv_sec = ts[1].tv_sec;
-	// tv[1].tv_usec = ts[1].tv_nsec / 1000;
-	// res = lutimes(new_path, tv);
-	// if (res == -1)
-	// {
-	// 	free(new_path);
-	// 	return -errno;
-	// }
-
-	// free(new_path);
 	return 0;
 }
 
 static int obuilder_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
 	int fd;
+ 	int res;
+	struct fuse_context *fc;
 	char *new_path = process_path(path, false);
-
+	DEBUG_PRINT(("Using create for %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s for creating\n", new_path));
@@ -681,15 +699,19 @@ static int obuilder_create(const char *path, mode_t mode, struct fuse_file_info 
 	}
 
 	fi->fh = fd;
+	
+	fc = fuse_get_context();
+	res = chown_file(new_path, fc, &chown);	
+
 	free(new_path);
-	return 0;
+	return res;
 }
 
 static int obuilder_open(const char *path, struct fuse_file_info *fi)
 {
 	int fd;
 	char *new_path = process_path(path, false);
-
+	DEBUG_PRINT(("Opening for %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s for opening\n", new_path));
@@ -712,22 +734,15 @@ static int obuilder_read(const char *path, char *buf, size_t size, off_t offset,
 												 struct fuse_file_info *fi)
 {
 	int res;
-
-	char *new_path = process_path(path, false);
-
-	if (new_path == NULL)
-	{
-		DEBUG_PRINT(("Failed to get %s for reading\n", new_path));
-		return -errno;
-	}
-
-	int fd = open(new_path, fi->flags);
+        DEBUG_PRINT(("Reading %s\n", path));
+	(void) path;
+        char *target_buf = buf;
 	// File handle okay?
-	res = pread(fd, buf, size, offset);
+	res = pread(fi->fh, target_buf, size, offset);
   
 	if (res == -1)
 	{
-		res = -errno;
+		return -errno;
 	}
 	return res;
 }
@@ -736,7 +751,7 @@ static int obuilder_read_buf(const char *path, struct fuse_bufvec **bufp,
 														 size_t size, off_t offset, struct fuse_file_info *fi)
 {
 	struct fuse_bufvec *src;
-
+	DEBUG_PRINT(("Read buffing %s \n", path));
 	(void)path;
 
 	src = malloc(sizeof(struct fuse_bufvec));
@@ -758,18 +773,10 @@ static int obuilder_write(const char *path, const char *buf, size_t size,
 													off_t offset, struct fuse_file_info *fi)
 {
 	int res;
-
-	char *new_path = process_path(path, false);
-
-	if (new_path == NULL)
-	{
-		DEBUG_PRINT(("Failed to get %s for writing\n", new_path));
-		return -errno;
-	}
-
-	int fd = open(new_path, fi->flags);
-
-	res = pwrite(fd, buf, size, offset);
+	DEBUG_PRINT(("Writing to %s\n", path));
+	(void) path;
+    	char *source_buf = (char*)buf;
+        res = pwrite(fi->fh, source_buf, size, offset);
 
 	if (res == -1)
 	{
@@ -782,7 +789,7 @@ static int obuilder_write_buf(const char *path, struct fuse_bufvec *buf,
 															off_t offset, struct fuse_file_info *fi)
 {
 	struct fuse_bufvec dst = FUSE_BUFVEC_INIT(fuse_buf_size(buf));
-
+	DEBUG_PRINT(("Write buffing %s\n", path));
 	(void)path;
 
 	dst.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
@@ -797,7 +804,7 @@ static int obuilder_statfs(const char *path, struct statvfs *stbuf)
 	int res;
 
 	char *new_path = process_path(path, false);
-
+	DEBUG_PRINT(("Statfsing %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s for statfs-ing\n", new_path));
@@ -815,26 +822,27 @@ static int obuilder_statfs(const char *path, struct statvfs *stbuf)
 	return 0;
 }
 
-static int obuilder_flush(const char *path, struct fuse_file_info *fi)
+/* static int obuilder_flush(const char *path, struct fuse_file_info *fi)
 {
 	int res;
-
+	DEBUG_PRINT(("Flushing %s\n", path));
 	(void)path;
-	/* This is called from every close on an open file, so call the
+	 This is called from every close on an open file, so call the
 	   close on the underlying filesystem.	But since flush may be
 	   called multiple times for an open file, this must not really
 	   close the file.  This is important if used on a network
-	   filesystem like NFS which flush the data/metadata on close() */
+	   filesystem like NFS which flush the data/metadata on close() 
 	res = close(dup(fi->fh));
 	if (res == -1)
 		return -errno;
 
 	return 0;
-}
+} */
 
 static int obuilder_release(const char *path, struct fuse_file_info *fi)
 {
 	(void)path;
+	DEBUG_PRINT(("Releasing %s\n", path));
 	close(fi->fh);
 
 	return 0;
@@ -844,8 +852,7 @@ static int obuilder_fsync(const char *path, int isdatasync,
 													struct fuse_file_info *fi)
 {
 	int res;
-	(void)path;
-
+	DEBUG_PRINT(("Fsyncing %s\n", path));
 #ifndef HAVE_FDATASYNC
 	(void)isdatasync;
 #else
@@ -866,7 +873,7 @@ static int obuilder_fallocate(const char *path, int mode,
 {
 #ifdef __APPLE__
 	fstore_t fstore;
-
+        DEBUG_PRINT(("Fallocing %s\n", path));
 	if (!(mode & PREALLOCATE))
 		return -ENOTSUP;
 
@@ -912,7 +919,7 @@ static int obuilder_setxattr(const char *path, const char *name, const char *val
 #ifdef __APPLE__
 	int res;
 	char *new_path = process_path(path, false);
-
+        DEBUG_PRINT(("Setting xattr for %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s for setattrx-ing\n", new_path));
@@ -957,7 +964,7 @@ static int obuilder_getxattr(const char *path, const char *name, char *value,
 #ifdef __APPLE__
 	int res;
 	char *new_path = process_path(path, false);
-
+        DEBUG_PRINT(("Getting xattr for %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s for getattrx-ing\n", new_path));
@@ -992,7 +999,7 @@ static int obuilder_listxattr(const char *path, char *list, size_t size)
 {
 #ifdef __APPLE__
 	char *new_path = process_path(path, false);
-
+        DEBUG_PRINT(("Listing xattr for %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s for listxattr-ing\n", new_path));
@@ -1047,7 +1054,7 @@ static int obuilder_removexattr(const char *path, const char *name)
 #ifdef __APPLE__
 	int res;
 	char *new_path = process_path(path, false);
-
+        DEBUG_PRINT(("Removing xattr for %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s for removeattr-ing\n", new_path));
@@ -1083,7 +1090,7 @@ static int obuilder_lock(const char *path, struct fuse_file_info *fi, int cmd,
 												 struct flock *lock)
 {
 	char *new_path = process_path(path, false);
-
+        DEBUG_PRINT(("Locking for %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s for locking\n", new_path));
@@ -1108,7 +1115,7 @@ static int obuilder_lock(const char *path, struct fuse_file_info *fi, int cmd,
 static int obuilder_flock(const char *path, struct fuse_file_info *fi, int op)
 {
 	char *new_path = process_path(path, false);
-
+	DEBUG_PRINT(("Flocking for %s but really %s\n", path, new_path));
 	if (new_path == NULL)
 	{
 		DEBUG_PRINT(("Failed to get %s for flocking\n", new_path));
@@ -1132,13 +1139,8 @@ static int obuilder_flock(const char *path, struct fuse_file_info *fi, int op)
 	return res;
 }
 
-void *
-obuilder_init(struct fuse_conn_info *conn)
+void *obuilder_init(struct fuse_conn_info *conn)
 {
-#ifdef __APPLE__
-	FUSE_ENABLE_SETVOLNAME(conn);
-	FUSE_ENABLE_XTIMES(conn);
-#endif
 	return NULL;
 }
 
@@ -1175,11 +1177,11 @@ static struct fuse_operations obuilder_oper = {
 		.write = obuilder_write,
 		.write_buf = obuilder_write_buf,
 		.statfs = obuilder_statfs,
-		.flush = obuilder_flush,
+		// .flush = obuilder_flush,
 		.release = obuilder_release,
 		.fsync = obuilder_fsync,
 #if defined(HAVE_POSIX_FALLOCATE) || defined(__APPLE__)
-		.fallocate = obuilder_fallocate,
+		// .fallocate = obuilder_fallocate,
 #endif
 #ifdef HAVE_SETXATTR
 		.setxattr = obuilder_setxattr,
@@ -1203,8 +1205,7 @@ static struct fuse_operations obuilder_oper = {
 		// .setattr_x = obuilder_setattr_x,
 		// .fsetattr_x = obuilder_fsetattr_x,
 		.flag_nullpath_ok = 1,
-		.flag_utime_omit_ok = 1};
-
+		.flag_utime_omit_ok = 1,};
 int main(int argc, char *argv[])
 {
 	umask(0);
