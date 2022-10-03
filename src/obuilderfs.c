@@ -1210,7 +1210,7 @@ int main(int argc, char *argv[])
 {
 	umask(0);
 
-	if (!strcmp(argv[1], "--help"))
+	if (argc < 2 || !strcmp(argv[1], "--help"))
 	{
 		printf("~~~ obuilder-fs version: 0.0.1 ~~~\n Usage:\n obuilderfs <scoreboard-path> <mount-point> <fuse-args-like-allow-other>\n");
 		return 0;
