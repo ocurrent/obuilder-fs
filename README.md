@@ -18,3 +18,9 @@ by a symbolic link inside another folder (e.g. `/data/scoreboard/`) using the `U
 ```
 
 The CLI tool is very simple as expects `<scoreboard-path> <mount-point> <fuse-args-like-allow-other>...`. 
+
+A typical usage would be:
+
+```
+sudo obuilderfs ~/scoreboard /usr/local -o allow_other
+```
