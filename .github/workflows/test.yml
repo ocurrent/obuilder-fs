@@ -1,15 +1,22 @@
 name: Tests for obuilderfs
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
 jobs:
   test:
     strategy:
       matrix:
-        operating-system: [macos-latest]
+        operating-system: [macos-11, macos-12]
     runs-on: ${{ matrix.operating-system }}
     steps: 
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Get FUSE for OSX
-      run: brew install --cask osxfuse
+      run: brew install --cask macfuse
     - name: Builds
       run: make 
     - name: Info
