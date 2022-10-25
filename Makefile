@@ -1,8 +1,10 @@
+homebrew := $(shell brew --prefix)
+
 all:
 	$(MAKE) -C src 
 
 install:
-	cp ./install/obuilderfs /usr/local/bin/obuilderfs
+	cp ./install/obuilderfs $(homebrew)/bin/obuilderfs
 
 clean: 
 	$(MAKE) -C src clean
