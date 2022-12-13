@@ -7,6 +7,10 @@ on:
     types:
       - opened
       - synchronize
+  schedule:
+    # Prime the caches every Monday
+    - cron: 0 1 * * MON  
+    
 jobs:
   test:
     strategy:
