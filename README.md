@@ -1,6 +1,8 @@
 obuilder-fs
 -----------
 
+**obuilder-fs is no longer used to provide obuilder on macos. This project is archived for reference purposes only.**
+
 The File System for OBuilder x MacOS -- it's sole purpose is to redirect calls heading to some path (e.g. `/usr/local`) to a directory pointed to 
 by a symbolic link inside another folder (e.g. `/data/scoreboard/`) using the `UID` of the Fuse Context of the caller (e.g. `/data/scoreboard/<uid> ~~> /Volumes/tank/result/<hash>`). To make this clearer here is a series of steps this FS should take: 
 
